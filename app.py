@@ -1,5 +1,6 @@
 import dask
 from dask.distributed import Client
+from pathlib import Path
 from textwrap import dedent
 from wordcloud import WordCloud
 import streamlit as st
@@ -13,6 +14,30 @@ DATASET_OPTIONS = {
     "Respuestas (Body)": ("archive/Answers.csv", ["Body"]),
     "Etiquetas (Tag)": ("archive/Tags.csv", ["Tag"]),
 }
+
+WIKIPEDIA_PREFIX = "Wikipedia EN - "
+WIKIPEDIA_OPTIONS = [f"{WIKIPEDIA_PREFIX}{i}" for i in range(10)]
+
+
+def get_wikipedia_csv_files(base_archive: str = "archive", folder: str | None = None) -> list[str]:
+    """Return sorted CSV paths from archive/0..9 folders, or one specific folder."""
+    archive_path = Path(base_archive)
+    files: list[str] = []
+    folders = [folder] if folder is not None else list(map(str, range(10)))
+
+    for folder_name in folders:
+        folder_path = archive_path / folder_name
+        if folder_path.is_dir():
+            files.extend(str(p) for p in sorted(folder_path.glob("*.csv")))
+    return files
+
+
+def parse_wikipedia_folder(source_label: str) -> str | None:
+    """Extract folder number from labels like 'Wikipedia EN - 3'."""
+    if not source_label.startswith(WIKIPEDIA_PREFIX):
+        return None
+    folder = source_label[len(WIKIPEDIA_PREFIX):].strip()
+    return folder if folder in {str(i) for i in range(10)} else None
 
 def append_log(message: str) -> None:
     st.session_state.logs.append(message)
@@ -42,13 +67,27 @@ def get_scheduler_stats(client: Client) -> tuple[int, int, int]:
     return worker_count, threads, memory_limit
 
 
-def run_pipeline(selected_sources: list[str], chunksize: int) -> tuple[dict, str]:
+def run_pipeline(
+    selected_sources: list[str],
+    chunksize: int,
+    n_workers: int,
+    threads_per_worker: int,
+    memory_limit_gb: int,
+) -> tuple[dict, str]:
     append_log("Iniciando cliente de Dask...")
-    client = Client(n_workers=2, threads_per_worker=1, memory_limit="2GiB")
+    client = Client(
+        n_workers=n_workers,
+        threads_per_worker=threads_per_worker,
+        memory_limit=f"{memory_limit_gb}GiB",
+    )
     dashboard_link = client.dashboard_link
     worker_count, threads_per_worker, memory_limit = get_scheduler_stats(client)
 
     append_log(f"Cliente activo. Link del dashboard de Dask: {dashboard_link}")
+    append_log(
+        "Configuración seleccionada: "
+        f"workers={n_workers}, threads/worker={threads_per_worker}, RAM/worker={memory_limit_gb}GiB"
+    )
     append_log(f"Número de workers: {worker_count}")
     append_log(f"Hilos por worker: {threads_per_worker}")
     append_log(f"Memoria límite por worker: {memory_limit} bytes")
@@ -57,9 +96,20 @@ def run_pipeline(selected_sources: list[str], chunksize: int) -> tuple[dict, str
         append_log("Creando las tasks de Dask usando el método delayed...")
         tasks = []
         for source in selected_sources:
-            path, columns = DATASET_OPTIONS[source]
-            append_log(f"Preparando task: {path} columnas={columns}")
-            tasks.append(dask.delayed(count_words_in_csv)(path, columns, chunksize))
+            wiki_folder = parse_wikipedia_folder(source)
+            if wiki_folder is not None:
+                wiki_files = get_wikipedia_csv_files("archive", folder=wiki_folder)
+                append_log(f"Wikipedia EN - {wiki_folder}: {len(wiki_files)} archivos CSV detectados")
+                for wiki_path in wiki_files:
+                    append_log(f"Preparando task: {wiki_path} columnas=['title', 'text']")
+                    tasks.append(dask.delayed(count_words_in_csv)(wiki_path, ["title", "text"], chunksize))
+            else:
+                path, columns = DATASET_OPTIONS[source]
+                append_log(f"Preparando task: {path} columnas={columns}")
+                tasks.append(dask.delayed(count_words_in_csv)(path, columns, chunksize))
+
+        if not tasks:
+            raise ValueError("No se encontraron archivos para procesar.")
 
         append_log("Reducciendo los resultados con merge_counters...")
         total_counts = dask.delayed(merge_counters)(tasks)
@@ -93,13 +143,22 @@ def main() -> None:
             """
             ## Nube de Palabras con Dask!
 
-            Esta app puede leer tres archivos CSV grandes que contienen preguntas, respuestas y etiquetas de StackOverflow.
-            En concreto, del 10% de las preguntas de la plataforma. Estos tres archivos suman más de 1.5GB,
-            por lo que se procesan en chunks usando Dask para mantener el uso de memoria bajo control.
+            Esta app procesa datasets CSV grandes con Dask para construir una nube de palabras sin cargar todo en memoria.
+            Combina dos fuentes principales: datos de StackOverflow y un subconjunto de artículos de Wikipedia en inglés.
+
+            StackOverflow (StackSample):
 
             - `Answers.csv` - Pesa 1.5GB.
             - `Questions.csv` - Pesa 1.9GB.
             - `Tags.csv` - Pesa 65MB, pero tiene una cantidad de columnas superior a 104000.
+
+            Wikipedia EN (subconjunto local):
+
+            - Carpetas `archive/0` a `archive/9` con múltiples CSV.
+            - Se leen únicamente las columnas `title` y `text` para el conteo de palabras.
+
+            Este enfoque permite escalar el análisis por lotes (chunks) y agregar más archivos en `archive/0..9`
+            sin cambiar la lógica principal de la app.
 
             Si intentamos cargar estos archivos directamente en memoria usando pandas, probablemente nos quedemos
             sin memoria RAM. En cambio, Dask permite procesarlos en partes (chunks) y realizar operaciones de
@@ -112,9 +171,11 @@ def main() -> None:
 
     with left:
         st.subheader("Controles")
+        source_options = list(DATASET_OPTIONS.keys()) + WIKIPEDIA_OPTIONS
+
         selected_sources = st.multiselect(
             "Contar palabras en:",
-            options=list(DATASET_OPTIONS.keys()),
+            options=source_options,
             default=list(DATASET_OPTIONS.keys()),
         )
 
@@ -126,6 +187,32 @@ def main() -> None:
             value=20000,
             help="Los chunks más pequeños reducen el uso pico de memoria pero pueden tardar más en completarse.",
         )
+
+        slider_col, _ = st.columns([1, 3])
+        with slider_col:
+            n_workers = st.slider(
+                "Número de workers",
+                min_value=2,
+                max_value=4,
+                step=1,
+                value=2,
+            )
+
+            threads_per_worker = st.slider(
+                "Hilos por worker",
+                min_value=1,
+                max_value=2,
+                step=1,
+                value=1,
+            )
+
+            memory_limit_gb = st.slider(
+                "RAM máxima por worker (GB)",
+                min_value=1,
+                max_value=3,
+                step=1,
+                value=2,
+            )
 
         run_clicked = st.button("Contar palabras", type="primary", disabled=st.session_state.running)
 
@@ -140,13 +227,30 @@ def main() -> None:
             if not selected_sources:
                 st.warning("Elige al menos un dataset.")
             else:
+                missing_wiki = []
+                for source in selected_sources:
+                    wiki_folder = parse_wikipedia_folder(source)
+                    if wiki_folder is not None and not get_wikipedia_csv_files("archive", folder=wiki_folder):
+                        missing_wiki.append(wiki_folder)
+
+                if missing_wiki:
+                    folders = ", ".join(sorted(missing_wiki))
+                    st.warning(f"No se encontraron archivos CSV en archive/{folders} para Wikipedia.")
+                    return
+
                 st.session_state.logs = []
                 st.session_state.running = True
                 st.session_state.last_image = None
 
                 with st.spinner("Procesando..."):
                     try:
-                        freq_dict, dashboard_link = run_pipeline(selected_sources, chunksize)
+                        freq_dict, dashboard_link = run_pipeline(
+                            selected_sources,
+                            chunksize,
+                            n_workers,
+                            threads_per_worker,
+                            memory_limit_gb,
+                        )
                         st.session_state.dashboard_link = dashboard_link
 
                         append_log("Generando nube de palabras...")

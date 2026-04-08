@@ -2,12 +2,28 @@ import dask
 from dask.distributed import Client
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+import csv
 import re
+import sys
 from collections import Counter
 import pandas as pd
 
 
 WORD_RE = re.compile(r'[a-z]+')
+
+
+def _set_csv_field_limit() -> None:
+    """Raise CSV field size limit to support very long text cells."""
+    max_int = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(max_int)
+            break
+        except OverflowError:
+            max_int = int(max_int / 10)
+
+
+_set_csv_field_limit()
 
 
 def tokenize(text):
